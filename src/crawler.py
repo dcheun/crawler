@@ -11,11 +11,12 @@ informs crawler to go n levels down on the website.
 """
 
 from cStringIO import StringIO
+import codecs
 import csv
 import getopt
 import mimetypes
 import os
-from PIL import Image
+from PIL import Image, ImageDraw
 import pickle
 import re
 import shutil
@@ -62,6 +63,7 @@ parent_output_dir = None
 export_to_pdf = False
 search_result_links = False
 windows_filenames = False
+nav_elements = []
 
 dry_run = False
 
@@ -471,6 +473,8 @@ class BrowserMgr(object):
         if download_dir:
             prefs.update({'download.default_directory':download_dir})
         profile.add_experimental_option('prefs',prefs)
+        # Remove the "Chrome is controlled by automated software" infobar.
+        profile.add_experimental_option('excludeSwitches', ['enable-automation'])
         return profile
     
     def _new_browser(self, start_url=None, cookies=None, download_dir=None):
@@ -654,7 +658,7 @@ def fullpage_screenshot(driver, filepath):
     
     This is a workaround for the Firefox/Chrome webdrivers that stopped
     support for full page screenshots. This function scrolls through the page
-    taking screenshots and then stitching them together to produce the
+    taking screenshots and then stitch them together to produce the
     final full page.
     
     @note: Works for Firefox/Chrome.
@@ -665,23 +669,43 @@ def fullpage_screenshot(driver, filepath):
     @param filepath: The filepath to save the image to.
     
     """
-    # Executes some javascript to get page dimensions and properties.
+    global nav_elements
+    # Execute some javascript to manipulate the page for better screenshots.
+    # Try to find the top navigation or header pane so the it is not
+    # captured on every stitch. This will be passed to javascript querySelector.
+    # Set Navigation Bar to Absolute so they can scroll out of the way.
+    # NOTE: This will need to be custom, as every page will be built differently.
+    # NOTE: Recommend using Chrome dev tools.
+    for nav in nav_elements:
+        driver.execute_script('''
+            if (document.querySelector("%s")) {
+                document.querySelector("%s").setAttribute("style", "position: relative;");
+            }
+        ''' % (nav, nav));
+    # Override any scrolling behavior.
+    browser.execute_script('''
+        document.body.parentElement.style.scrollBehavior = 'auto';
+    ''')
+    # Execute some javascript to manipulate the page for better screenshots.
+    # Get rid of the scrollbars if any.
+    browser.execute_script('''
+        const s = document.createElement("style");
+        s.textContent = "body::-webkit-scrollbar { display: none;} body { scrollbar-width: none; }";
+        document.head.insertAdjacentElement("beforeend", s);
+    ''');
+    time.sleep(0.3)
+    ###########################################################################
+    # Initial calculations and scroll through of page to load all contents.
+    # There may be some contents that are lazy load, meaning it might not
+    # load until the section is scrolled into view. This can in alter the
+    # page size, thus we need to recalculate page size and rectangles.
+    ###########################################################################
+    # Get page dimensions and properties.
     total_width = driver.execute_script("return document.body.offsetWidth")
     total_height = driver.execute_script("return document.body.parentNode.scrollHeight")
     viewport_width = driver.execute_script("return document.body.clientWidth")
     viewport_height = driver.execute_script("return window.innerHeight")
-    # Try to find the top navigation or header pane so the it is not
-    # captured on every stitch.
-    try:
-        topnav = driver.find_element_by_id('topnav')
-    except Exception:
-        topnav = None
-    try:
-        header = driver.find_element_by_tag_name('header')
-    except Exception:
-        header = None
-    if topnav is None and header is not None:
-        topnav = header
+    # Calculate viewport rectangles.
     rectangles = []
     i = 0
     while i < total_height:
@@ -693,39 +717,105 @@ def fullpage_screenshot(driver, filepath):
             top_width = ii + viewport_width
             if top_width > total_width:
                 top_width = total_width
-            rectangles.append((ii, i, top_width,top_height))
+            rectangles.append((ii, i, top_width, top_height))
             ii = ii + viewport_width
         i = i + viewport_height
-    
-    stitched_image = None
-    previous = None
-    part = 0
+    # Initial scroll through of the page to load contents.
     for rectangle in rectangles:
-        # Modification note: Always scroll to the top first otherwise we get
-        # parts of website stitched unevenly.
-        driver.execute_script("window.scrollTo({0}, {1})".format(rectangle[0], rectangle[1]))
+        driver.execute_script("window.scrollTo({{left: {0}, top: {1}, behavior: 'auto'}})".format(rectangle[0], rectangle[1]))
         time.sleep(0.2)
-        if topnav is not None:
-            # This is to hide the top navigation/header bars so that they don't
-            # get captured on every stitch.
-            driver.execute_script("arguments[0].setAttribute('style', 'position: absolute; top: 0px;');", topnav)
-            time.sleep(0.2)
+    time.sleep(1)
+    driver.execute_script("window.scrollTo(0, 0)")
+    time.sleep(1)
+    driver.execute_script("window.scrollTo(0, 0)")
+    time.sleep(1)
+    ###########################################################################
+    # This should now be a pretty accurate fetch of viewport and page size.
+    ###########################################################################
+    # Re-fetch page dimensions.
+    total_width = driver.execute_script("return document.body.offsetWidth")
+    total_height = driver.execute_script("return document.body.parentNode.scrollHeight")
+    viewport_width = driver.execute_script("return document.body.clientWidth")
+    viewport_height = driver.execute_script("return window.innerHeight")
+    # Calculate viewport rectangles.
+    rectangles = []
+    i = 0
+    while i < total_height:
+        ii = 0
+        top_height = i + viewport_height
+        if top_height > total_height:
+            top_height = total_height
+        while ii < total_width:
+            top_width = ii + viewport_width
+            if top_width > total_width:
+                top_width = total_width
+            rectangles.append((ii, i, top_width, top_height))
+            ii = ii + viewport_width
+        i = i + viewport_height
+    ###########################################################################
+    # Initialize image and other variables.
+    ###########################################################################
+    stitched_image = None
+    stitched_image_height = 0
+    # This MAX_HEIGHT is a limitation of the PIL library.
+    # NOTE: The PDF max height appears to be less than this.
+    # TODO: Break into different pages based on PDF max page height?
+    STITCHED_IMAGE_MAX_HEIGHT = 65500
+    previous = None
+    overlap = False
+    part = 0
+    # Main scroll through page and take screenshots.
+    for rectangle in rectangles:
+        # Note: Always scroll to the top first otherwise we get
+        # parts of website stitched unevenly.
+        driver.execute_script("window.scrollTo({{left: {0}, top: {1}, behavior: 'auto'}})".format(rectangle[0], rectangle[1]))
         time.sleep(0.2)
         file_name = '%s_part_%s.png' % (filepath,part)
         driver.get_screenshot_as_file(file_name)
         screenshot = Image.open(file_name)
+        # NOTE: CSS pixels are not equal to device pixels.
+        # We need to do conversion here as it might not always be equal.
+        conv = float(screenshot.size[1]) / viewport_height
+        
         if rectangle[1] + viewport_height > total_height:
-            offset = (rectangle[0], total_height - viewport_height)
+            offset = (int(rectangle[0] * conv), int((total_height - viewport_height) * conv))
+            overlap = True
         else:
-            offset = (rectangle[0], rectangle[1])
+            offset = (int(rectangle[0] * conv), int(rectangle[1] * conv))
+        if offset[1] >= STITCHED_IMAGE_MAX_HEIGHT:
+            # Simply break here and do not add additional stitches.
+            os.remove(file_name)
+            break
         if stitched_image is None:
-            stitched_image = Image.new('RGB', (screenshot.size[0], total_height))
-        stitched_image.paste(screenshot, offset)
+            stitched_image_height = int(total_height * conv)
+            if (stitched_image_height > STITCHED_IMAGE_MAX_HEIGHT):
+                stitched_image_height = STITCHED_IMAGE_MAX_HEIGHT
+            stitched_image = Image.new('RGB', (screenshot.size[0], stitched_image_height))
+        if overlap:
+            # Mask out portion of the last image so that we only paste the
+            # bottom portion of the overlap.
+            # Create a new mask, fill = black.
+            # Draw out the visible part we want to mask in white.
+            mask = Image.new('L', stitched_image.size, 0)
+            draw = ImageDraw.Draw(mask)
+            box = tuple(int(x*conv) for x in rectangle)
+            draw.rectangle(box, fill=255)
+            # This needs to be the same size as the stitched image.
+            bottom_img = Image.new('RGB', stitched_image.size)
+            bottom_img.paste(screenshot, offset)
+            # Paste into stitched while masking out upper portion.
+            stitched_image.paste(bottom_img, box=(0,0), mask=mask)
+        else:
+            stitched_image.paste(screenshot, offset)
         del screenshot
         os.remove(file_name)
         part = part + 1
         previous = rectangle
+    # Export PNG.
     stitched_image.save(filepath)
+    # Export to PDF.
+    pdf_filepath = '.'.join(filepath.split('.')[:-1] + ['pdf'])
+    stitched_image.save(pdf_filepath)
     return True
 
 
@@ -785,6 +875,30 @@ def _get_page_as_source(item, filename, parent_dir, level):
     with open(filepath,'wb') as f:
         f.write(item.page_source.encode('utf-8'))
     time.sleep(0.2)
+
+
+def write_info_file(item, filename, parent_dir, level):
+    """Saves an Item's INFO to a file.
+    
+    @param item: The Item object.
+    @param filename: The output filename (just file name).
+    @param parent_dir: Specify parent_output_dir here.
+    @param level: The current level.
+    
+    """
+    global browser, logfile, item_mgr
+    parent_path = os.path.join(parent_dir, str(level), 'info_source')
+    if not os.path.isdir(parent_path):
+        os.makedirs(parent_path, 0777)
+    filepath = os.path.join(parent_path, filename)
+    log('INFO',logfile,'Exporting to filepath=%s' % filepath)
+    # Save to file.
+    with open(filepath,'wb') as f:
+        message = ['loc: %s' % item.url]
+        message.append('changefreq: %s' % item.changefreq)
+        message.append('lastmod: %s' % item.lastmod)
+        f.write('\n'.join(message).encode('utf-8'))
+    time.sleep(0.1)
 
 
 def wget_file(item, filename, parent_dir, level):
@@ -1121,6 +1235,14 @@ def get_items(item, level=None):
             # Skip.
             continue
         
+        # Execute some javascript to manipulate the page for better screenshots.
+        # Get rid of the scrollbars if any.
+        browser.execute_script('''
+            const s = document.createElement("style");
+            s.textContent = "body::-webkit-scrollbar { display: none;} body { scrollbar-width: none; }";
+            document.head.insertAdjacentElement("beforeend", s);
+        ''');
+        
         time.sleep(0.5)
         if new_item.onclick_id:
             time.sleep(0.5)
@@ -1178,6 +1300,186 @@ def get_items(item, level=None):
     # Clear page source and next level links to save memory.
     item.page_source = None
     item.next_level_links = None
+
+
+def get_item(item, level=None):
+    """Process and item.
+    
+    @param item: The Item object.
+    @keyword level: The current level.
+    
+    """
+    global allowed_domains, browser
+    global sub_urls
+    global process_adobe_wiki, logfile
+    global dry_run, parent_output_dir, export_to_pdf
+    global search_result_links, windows_filenames
+    global item_mgr
+    global script_args
+
+    new_item = item
+    
+    try:
+        res = get_tld(new_item.url)
+    except Exception:
+        item_mgr.invalid_cnt += 1
+        if new_item.url in item_mgr.invalid_urls:
+            item_mgr.invalid_urls[new_item.url] += 1
+        else:
+            item_mgr.invalid_urls[new_item.url] = 1
+        log('INFO',logfile,'INVALID URL FOUND (%s): %s' % (item_mgr.invalid_urls[new_item.url],new_item))
+        return
+    # TODO: This functionality doesn't seem to be working properly.
+    if res not in allowed_domains:
+        item_mgr.non_domain_cnt += 1
+        if new_item.url in item_mgr.non_domain_urls:
+            item_mgr.non_domain_urls[new_item.url] += 1
+        else:
+            item_mgr.non_domain_urls[new_item.url] = 1
+        log('INFO',logfile,'NON DOMAIN URL FOUND (%s): %s' % (item_mgr.non_domain_urls[new_item.url],new_item))
+        return
+    found_false_sub_url = False
+    for sub_url in sub_urls:
+        if sub_url not in new_item.url:
+            item_mgr.non_domain_cnt += 1
+            if new_item.url in item_mgr.non_domain_urls:
+                item_mgr.non_domain_urls[new_item.url] += 1
+            else:
+                item_mgr.non_domain_urls[new_item.url] = 1
+            log('INFO',logfile,'NON DOMAIN URL FOUND (%s): %s' % (item_mgr.non_domain_urls[new_item.url],new_item))
+            found_false_sub_url = True
+            break
+    if found_false_sub_url:
+        return
+    # Check if the url is a duplicate.
+    found_dup, added_dup, found_section = False, False, False
+    # Check for sections.
+    try:
+        (base_url,section) = re.search(r'(.*)/([#][^/]+)$',new_item.url).groups()
+    except AttributeError:
+        (base_url,section) = None,None
+    if section:
+        found_section = True
+    if new_item.url in item_mgr.dup_urls:
+        if new_item.onclick_id in item_mgr.dup_urls[new_item.url]:
+            found_dup = True
+        else:
+            item_mgr.dup_urls[new_item.url].update({new_item.onclick_id:{'cnt':0,'sec_cnt':0}})
+            added_dup = True
+    if found_dup:
+        item_mgr.dup_urls[new_item.url][new_item.onclick_id]['cnt'] += 1
+        item_mgr.dup_cnt += 1
+        log('INFO',logfile,'DUPLICATE URL FOUND (%s): %s' % (item_mgr.dup_urls[new_item.url],new_item))
+        return
+    if section:
+        if base_url not in item_mgr.dup_urls:
+            item_mgr.dup_urls[base_url] = {new_item.onclick_id:{'cnt':0,'sec_cnt':0}}
+        else:
+            if new_item.onclick_id in item_mgr.dup_urls[base_url]:
+                # Add full new_item.url to dups.
+                item_mgr.dup_urls[new_item.url] = {new_item.onclick_id:{'cnt':0,'sec_cnt':0}}
+                # Then increment section counter of base_url.
+                item_mgr.dup_urls[base_url][new_item.onclick_id]['cnt'] += 1
+                item_mgr.dup_urls[base_url][new_item.onclick_id]['sec_cnt'] += 1
+                item_mgr.dup_cnt += 1
+                log('INFO',logfile,'DUPLICATE URL SECTION FOUND (%s): %s' % (item_mgr.dup_urls[new_item.url],new_item))
+                return
+            else:
+                item_mgr.dup_urls[base_url] = {new_item.onclick_id:{'cnt':0,'sec_cnt':0}}
+    # Load URL (mostly to get page source), then add to duplicate definition.
+    log('INFO',logfile,'Getting new item page source: %s, onclick_id=%s' % (new_item.url,new_item.onclick_id))
+    
+    try:
+        browser.get(new_item.url)
+    except TimeoutException:
+        # Log and skip the page that times out.
+        # Consider this an Error. Add to dup.
+        log('ERROR',logfile,"Page='%s': EXC=%s" %
+            (new_item.url,traceback.format_exc().splitlines()[-1]))
+        log('ERROR',logfile,'SKIPPING PAGE, NEEDS MANUAL COLLECTION.')
+        item_mgr.timeout_cnt += 1
+        if new_item.url in item_mgr.timeout_urls:
+            item_mgr.timeout_urls[new_item.url] += 1
+        else:
+            item_mgr.timeout_urls[new_item.url] = 1
+        item_mgr.error_cnt += 1
+        if new_item.url in item_mgr.error_urls:
+            item_mgr.error_urls[new_item.url] += 1
+        else:
+            item_mgr.error_urls[new_item.url] = 1
+        # Added to dup.
+        if not added_dup:
+            item_mgr.dup_urls[new_item.url] = {new_item.onclick_id:{'cnt':0,'sec_cnt':0}}
+        # Skip.
+        return
+    
+    # Execute some javascript to manipulate the page for better screenshots.
+    # Get rid of the scrollbars if any.
+    browser.execute_script('''
+        const s = document.createElement("style");
+        s.textContent = "body::-webkit-scrollbar { display: none;} body { scrollbar-width: none; }";
+        document.head.insertAdjacentElement("beforeend", s);
+    ''');
+    
+    time.sleep(3)
+    if new_item.onclick_id:
+        time.sleep(0.5)
+        browser.find_element_by_id(new_item.onclick_id).click()
+        time.sleep(0.3)
+    new_item.page_source = browser.page_source
+    #######################################################################
+    # Export this level items here for quicker processing.
+    #######################################################################
+    log('INFO',logfile,str(new_item))
+    # Build the file name for the output file.
+    filename = new_item.url.split('https://')[-1]
+    filename = re.sub(r'[^a-z.A-Z0-9]','.-',filename.split('http://')[-1])
+    if windows_filenames:
+        if len(filename) > 255:
+            # Strip out some characters from filename.
+            filename = filename[:50] +'__'+ filename[-50:]
+    if process_adobe_wiki:
+        log('INFO',logfile,'Getting Adobe wiki page %s...' % (new_item.url))
+        if not dry_run:
+            get_adobe_wiki_page(new_item, filename, parent_output_dir, level)
+    png_filename = '%s_%s.png' % (item_mgr.cnt, filename)
+    pdf_filename = '%s_%s.pdf' % (item_mgr.cnt, filename)
+    html_filename = '%s_%s.html' % (item_mgr.cnt, filename)
+    info_filename = '%s_%s.txt' % (item_mgr.cnt, filename)
+    if export_to_pdf:
+        exp_filename = pdf_filename
+    else:
+        exp_filename = png_filename
+    if not script_args.get('only-downloadable'):
+        log('INFO',logfile,'Getting snapshot of page %s...' % new_item.url)
+        if not dry_run:
+            get_page_as_file(new_item, exp_filename, parent_output_dir, level)
+    if script_args.get('get-source'):
+        log('INFO',logfile,'Getting HTML source of page %s...' % new_item.url)
+        if not dry_run:
+            get_page_as_source(new_item, html_filename, parent_output_dir, level)
+    # Write info to info file.
+    write_info_file(new_item, info_filename, parent_output_dir, level)
+    # Update stats.
+    item_mgr.cnt += 1
+    time.sleep(0.3)
+    new_item.processed = True
+    # Move any downloads to output level directory.
+    move_files(os.path.join(parent_output_dir,'main'),
+               os.path.join(parent_output_dir,str(level)))
+    
+    new_item.page_source = None
+    # Append to items list.
+    if str(level) in item_mgr.items:
+        item_mgr.items[str(level)].append(new_item)
+    else:
+        item_mgr.items[str(level)] = [new_item]
+    # Add to dup
+    if not added_dup:
+        item_mgr.dup_urls[new_item.url] = {new_item.onclick_id:{'cnt':0,'sec_cnt':0}}
+    # Save after processing every 25 documents.
+    if item_mgr.cnt > 0 and item_mgr.cnt % 25 == 0:
+        item_mgr.save()
 
 
 def process(items, levels, current_level):
@@ -1261,6 +1563,48 @@ def process(items, levels, current_level):
     # Recursively call process for next level items.
     next_level_items = item_mgr.items.get(str(current_level + 1),[])
     process(next_level_items, levels, current_level + 1)
+
+
+def process_file(_file, levels=None, current_level=1):
+    """Main crawler function for processing file with list of URLs.
+    
+    Processing involves:
+    1. Parsing file containing list of URLs.
+    2. Loop through all urls and capture information.
+    
+    @param _file: Absolute path to file to process.
+    
+    """
+    global logfile, item_mgr
+    
+    file_gen = file_generator(_file)
+    
+    # Skip to last left off.
+    cnt = -1
+    skip_cnt = item_mgr.cnt
+    if skip_cnt:
+        log('INFO', logfile, 'Detected %s URLs already processed, skipping ahead...' % (skip_cnt),
+            print_stdout=True)
+    
+    for url in file_gen:
+        cnt += 1
+        if cnt < skip_cnt:
+            continue
+        item = Item()
+        item.url = url
+        get_item(item, 1)
+        time.sleep(0.2)
+
+
+def file_generator(_file):
+    """Generator object for file.
+    
+    Each call to next() yields one line of content from the file.
+    
+    """
+    with codecs.open(_file, encoding='utf-8') as f:
+        for line in f:
+            yield line
 
 
 def init_logfile(logfile):
@@ -1353,6 +1697,10 @@ def usage():
             The number of levels to dive into website.
       -c <COOKIE_FILE>, --cookies=<COOKIE_FILE>
             The cookies file to load.
+      -f <URL_FILE>, --file=<URL_FILE>
+            A file with list of URLs to parse.
+      --nav-elements=<NAV_ELEMENTS>
+            Specify the nav elements of the page, comma separated string.
       --dry-run
             Lists out all the hyperlinks, and does not actually export
             or converts any pages.
@@ -1380,12 +1728,13 @@ def handle_args():
     global script_args
     
     try:
-        opts, args = getopt.getopt(sys.argv[1:], 's:a:b:o:l:c:h',
+        opts, args = getopt.getopt(sys.argv[1:], 's:a:b:o:l:c:f:h',
                                    ['start-url=','allowed-domains=','output-dir'
-                                    'sub-urls=','levels=','cookies=',
+                                    'sub-urls=','levels=','cookies=','file=',
+                                    'nav-elements=',
                                     'dry-run','export-to-pdf','chrome',
-                                    'only-downloadable','get-source','search-result-links',
-                                    'windows-filenames',
+                                    'only-downloadable','get-source',
+                                    'search-result-links','windows-filenames',
                                     'help','debug'])
     except getopt.GetoptError as e:
         # Print usage info and exit.
@@ -1404,8 +1753,12 @@ def handle_args():
             script_args['output-dir'] = a
         elif o == '-c' or o == '--cookies':
             script_args['cookies'] = a
+        elif o == '-f' or o == '--file':
+            script_args['file'] = a
         elif o == '-b' or o == '--sub-urls':
             script_args['sub-urls'] = a
+        elif o == '--nav-elements':
+            script_args['nav-elements'] = a
         elif o == '-h' or o == '--help':
             script_args['help'] = a
         elif o == '--dry-run':
@@ -1446,7 +1799,7 @@ def main():
     global browser, browser_profile, browser_type
     global parent_output_dir, dry_run, export_to_pdf
     global search_result_links, windows_filenames
-    global item_mgr
+    global item_mgr, nav_elements
     handle_args()
     
     # Set globals.
@@ -1458,10 +1811,15 @@ def main():
     start_url = script_args['start-url']
     allowed_domains = script_args['allowed-domains'].split(',')
     parent_output_dir = script_args['output-dir']
+    _file = script_args.get('file', None)
     try:
         sub_urls = script_args['sub-urls'].split(',')
     except Exception:
         sub_urls = []
+    try:
+        nav_elements = script_args['nav-elements'].split(',')
+    except Exception:
+        nav_elements = []
     
     # Initialize logfile.
     logfile = os.path.join(parent_output_dir,'crawler.log')
@@ -1493,6 +1851,9 @@ def main():
         main_profile = BrowserMgr.get_new_browser_profile(download_dir=main_download_dir)
         browser = webdriver.Firefox(firefox_profile=main_profile)
     
+#     browser.maximize_window()
+    browser.set_window_size(1920,1080)
+    time.sleep(1)
     browser.get(start_url)
     time.sleep(60)
     
@@ -1533,7 +1894,10 @@ def main():
     # Begin processing.
     ###########################################################
     try:
-        process([item], levels, current_level)
+        if (_file):
+            process_file(_file)
+        else:
+            process([item], levels, current_level)
     except Exception:
         log('ERROR',logfile,'\nERROR DETECTED: RESULTS MAY NOT BE COMPLETE!!!')
         log('ERROR',logfile,traceback.format_exc())
